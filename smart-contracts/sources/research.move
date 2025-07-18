@@ -1,19 +1,29 @@
 #[allow(unused_use, duplicate_alias)]
 module research::research {
-    use std::string::String;
+    use std::string::{Self, String};
     use std::vector;
-    use std::option;
+    use std::option::{Self, Option};
     use std::address;
     use iota::object::{Self, UID};
     use iota::tx_context::{Self, TxContext};
     use iota::transfer;
-    use iota::coin::{Self, TreasuryCap, CoinMetadata};
-    use iota::balance::Supply;
+    // Use only what we need
+    use iota::balance::{Self, Supply};
+    use iota::coin::{Self};
+    use iota::url::{Self, Url};
+    use iota::event;
 
-    /// --- Token for investor ownership ---
-    public struct RESEARCH_SHARE has drop {}
+    /// --- NFT for research proposal ---
+    public struct ResearchNFT has key, store {
+        id: UID,
+        title: String,
+        description: String,
+        researcher: address,
+        image_url: Option<Url>,
+        external_url: Option<Url>
+    }
 
-    /// --- Research proposal metadata ---
+    /// --- Metadata for proposal ---
     public struct ResearchMetadata has store {
         title: String,
         description: String,
@@ -26,19 +36,33 @@ module research::research {
         tags: vector<String>,
         is_funded: bool,
         dao_approved: bool,
-        milestone_approvals: vector<bool>
+        milestone_approvals: vector<bool>,
+        image_url: Option<Url>,
+        external_url: Option<Url>
     }
 
-    /// --- Research project on-chain object ---
+    /// --- Main Research object ---
     public struct ResearchPaper has key {
         id: UID,
+        nft_id: address,
         metadata: ResearchMetadata,
         total_raised: u64,
         current_milestone: u64,
-        is_revoked: bool
+        is_revoked: bool,
+        // Track investors and their shares
+        investors: vector<address>,
+        investments: vector<u64>
     }
 
-    /// --- DAO vote record for proposal or milestone ---
+    /// --- Investment record ---
+    public struct InvestmentRecord has key, store {
+        id: UID,
+        paper_id: address,
+        investor: address,
+        amount: u64,
+        percentage: u64  // Percentage of ownership * 10000 (e.g., 5% = 500)
+    }
+
     public struct VoteRecord has key {
         id: UID,
         yes_votes: u64,
@@ -46,24 +70,46 @@ module research::research {
         total_voters: u64
     }
 
-    /// === INIT: Set up the token ===
-    fun init(ctx: &mut TxContext) {
-        let (treasury_cap, metadata) = 
-            iota::coin::create_currency<RESEARCH_SHARE>(
-                RESEARCH_SHARE {},
-                6, // 6 decimals
-                b"RSH",
-                b"Research Share",
-                b"Token representing ownership in a research proposal",
-                option::none(),
-                ctx
-            );
-
-        transfer::public_transfer(treasury_cap, tx_context::sender(ctx));
-        transfer::public_share_object(metadata);
+    public struct ResearchPaperMintedEvent has copy, drop {
+        nft_id: address,
+        paper_id: address,
+        title: String,
+        researcher: address
     }
 
-    /// === Create a research proposal (Pre-research) ===
+    public struct InvestmentEvent has copy, drop {
+        paper_id: address,
+        amount: u64,
+        investor: address,
+        percentage: u64
+    }
+
+    // No need for init function - we're using native tokens
+
+    /// === Mint NFT ===
+    #[allow(lint(self_transfer))]
+    public fun mint_research_nft(
+        title: String,
+        description: String,
+        image_url: Option<Url>,
+        external_url: Option<Url>,
+        ctx: &mut TxContext
+    ): address {
+        let researcher = tx_context::sender(ctx);
+        let nft = ResearchNFT {
+            id: object::new(ctx),
+            title,
+            description,
+            researcher,
+            image_url,
+            external_url
+        };
+        let nft_id = object::uid_to_address(&nft.id);
+        transfer::public_transfer(nft, researcher);
+        nft_id
+    }
+
+    /// === Propose Research ===
     public fun propose_research(
         title: String,
         description: String,
@@ -73,6 +119,8 @@ module research::research {
         funding_goal: u64,
         revenue_projection: u64,
         tags: vector<String>,
+        image_url: Option<Url>,
+        external_url: Option<Url>,
         ctx: &mut TxContext
     ) {
         let mut milestone_approvals = vector::empty<bool>();
@@ -83,6 +131,11 @@ module research::research {
             i = i + 1;
         };
 
+        let researcher = tx_context::sender(ctx);
+        
+        // Store title for later use
+        let paper_title = title;
+        
         let metadata = ResearchMetadata {
             title,
             description,
@@ -91,134 +144,162 @@ module research::research {
             milestones,
             funding_goal,
             revenue_projection,
-            researcher: tx_context::sender(ctx),
+            researcher,
             tags,
             is_funded: false,
             dao_approved: false,
-            milestone_approvals
+            milestone_approvals,
+            image_url,
+            external_url
         };
 
+        let nft_id = mint_research_nft(paper_title, description, image_url, external_url, ctx);
+        let paper_id = object::new(ctx);
+        let paper_id_address = object::uid_to_address(&paper_id);
+        
         let paper = ResearchPaper {
-            id: object::new(ctx),
+            id: paper_id,
+            nft_id,
             metadata,
             total_raised: 0,
             current_milestone: 0,
-            is_revoked: false
+            is_revoked: false,
+            investors: vector::empty<address>(),
+            investments: vector::empty<u64>()
         };
+
+        event::emit(ResearchPaperMintedEvent {
+            nft_id,
+            paper_id: paper_id_address,
+            title: paper_title,
+            researcher
+        });
 
         transfer::share_object(paper);
     }
 
-    /// === Create a new vote record ===
-    public fun create_vote_record(ctx: &mut TxContext) {
-        let vote_record = VoteRecord {
-            id: object::new(ctx),
-            yes_votes: 0,
-            no_votes: 0,
-            total_voters: 0
-        };
-        transfer::share_object(vote_record);
-    }
-
-    /// === DAO Vote to approve the proposal ===
-    public fun vote_on_proposal(
-        vote_record: &mut VoteRecord,
-        approve: bool
-    ) {
-        vote_record.total_voters = vote_record.total_voters + 1;
-        if (approve) {
-            vote_record.yes_votes = vote_record.yes_votes + 1;
-        } else {
-            vote_record.no_votes = vote_record.no_votes + 1;
-        };
-    }
-
-    /// === Finalize the DAO decision (called by deployer/DAO) ===
-    public fun finalize_proposal(
+    // This function uses native IOTA tokens directly
+    public fun invest<CoinType: key + store>(
         paper: &mut ResearchPaper,
-        vote_record: &VoteRecord
+        payment: CoinType,  // Accept any coin type with key + store abilities
+        amount: u64,   
+        investor: address,
+        ctx: &mut TxContext
     ) {
-        assert!(!paper.metadata.dao_approved, 100);
-        if (vote_record.yes_votes > vote_record.total_voters / 2) {
+        assert!(paper.metadata.dao_approved, 100);
+        assert!(!paper.is_revoked, 101);
+
+        // Get the amount of tokens being invested
+        assert!(amount > 0, 102);
+        
+        // Consume the payment (transfer to researcher)
+        transfer::public_transfer(payment, paper.metadata.researcher);
+        
+        // Track the investment
+        paper.total_raised = paper.total_raised + amount;
+
+        // Calculate ownership percentage (as basis points, 1% = 100 points)
+        let percentage = if (paper.metadata.funding_goal == 0) {
+            0
+        } else {
+            (amount * 10000) / paper.metadata.funding_goal
+        };
+        
+        
+        // Track the investor and their investment
+        vector::push_back(&mut paper.investors, investor);
+        vector::push_back(&mut paper.investments, amount);
+        
+        // Create an investment record for the investor
+        let record = InvestmentRecord {
+            id: object::new(ctx),
+            paper_id: object::uid_to_address(&paper.id),
+            investor,
+            amount,
+            percentage
+        };
+        
+        transfer::public_transfer(record, investor);
+        
+        // Check if funding goal is reached
+        if (paper.total_raised >= paper.metadata.funding_goal) {
+            paper.metadata.is_funded = true;
+        };
+
+        // Emit event
+        event::emit(InvestmentEvent {
+            paper_id: object::uid_to_address(&paper.id),
+            amount,
+            investor,
+            percentage
+        });
+    }
+
+    /// === Get Investor Shares ===
+    public fun get_investor_share(
+        paper: &ResearchPaper,
+        investor: address
+    ): (u64, u64) { // Returns (investment_amount, percentage)
+        let len = vector::length(&paper.investors);
+        let mut i = 0;
+        let mut investment_amount = 0;
+        
+        // Find all investments by this investor
+        while (i < len) {
+            let current_investor = *vector::borrow(&paper.investors, i);
+            if (current_investor == investor) {
+                investment_amount = investment_amount + *vector::borrow(&paper.investments, i);
+            };
+            i = i + 1;
+        };
+        
+        // Calculate percentage
+        let percentage = if (paper.metadata.funding_goal == 0) {
+            0
+        } else {
+            (investment_amount * 10000) / paper.metadata.funding_goal
+        };
+        
+        (investment_amount, percentage)
+    }
+
+    /// === DAO Voting ===
+    public fun vote_on_proposal(vote: &mut VoteRecord, approve: bool) {
+        vote.total_voters = vote.total_voters + 1;
+        if (approve) { 
+            vote.yes_votes = vote.yes_votes + 1; 
+        } else { 
+            vote.no_votes = vote.no_votes + 1; 
+        };
+    }
+
+    public fun finalize_proposal(paper: &mut ResearchPaper, vote: &VoteRecord) {
+        assert!(!paper.metadata.dao_approved, 200);
+        if (vote.yes_votes > vote.total_voters / 2) {
             paper.metadata.dao_approved = true;
         };
     }
 
-    /// === Investors invest in the proposal ===
-    public fun invest(
-        cap: &mut TreasuryCap<RESEARCH_SHARE>,
-        amount: u64,
-        paper: &mut ResearchPaper,
-        investor: address,
-        ctx: &mut TxContext
-    ) {
-        assert!(paper.metadata.dao_approved, 101);
-        assert!(!paper.is_revoked, 102);
-
-        let coins = iota::coin::mint(cap, amount, ctx);
-        transfer::public_transfer(coins, investor);
-
-        paper.total_raised = paper.total_raised + amount;
-
-        if (paper.total_raised >= paper.metadata.funding_goal) {
-            paper.metadata.is_funded = true;
-        };
-    }
-
-    /// === DAO votes on milestone release ===
-    public fun vote_on_milestone(
-        vote_record: &mut VoteRecord,
-        approve: bool
-    ) {
-        vote_record.total_voters = vote_record.total_voters + 1;
-        if (approve) {
-            vote_record.yes_votes = vote_record.yes_votes + 1;
-        } else {
-            vote_record.no_votes = vote_record.no_votes + 1;
-        };
-    }
-
-    /// === Release funds for a milestone (called by DAO) ===
-    public fun fund_milestone(
-        paper: &mut ResearchPaper,
-        vote_record: &VoteRecord
-    ) {
-        assert!(!paper.is_revoked, 103);
-
-        if (vote_record.yes_votes > vote_record.total_voters / 2) {
-            let index = paper.current_milestone;
-            assert!(index < vector::length(&paper.metadata.milestone_approvals), 104);
-            
-            // Update milestone approval status
-            let milestone_ref = vector::borrow_mut(&mut paper.metadata.milestone_approvals, index);
-            *milestone_ref = true;
-            
-            // Advance to next milestone
-            paper.current_milestone = index + 1;
-        };
-    }
-
-    /// === DAO revokes funding for the paper ===
     public fun revoke_funding(paper: &mut ResearchPaper) {
         paper.is_revoked = true;
     }
 
-    /// === Getter functions for reading contract state ===
-    public fun get_paper_details(paper: &ResearchPaper): (String, u64, u64, bool) {
-        (
-            paper.metadata.title,
-            paper.metadata.funding_goal,
-            paper.total_raised,
-            paper.metadata.is_funded
-        )
+    public fun vote_on_milestone(vote: &mut VoteRecord, approve: bool) {
+        vote.total_voters = vote.total_voters + 1;
+        if (approve) { 
+            vote.yes_votes = vote.yes_votes + 1; 
+        } else { 
+            vote.no_votes = vote.no_votes + 1; 
+        };
     }
-    
-    public fun get_milestone_status(paper: &ResearchPaper, index: u64): bool {
-        assert!(index < vector::length(&paper.metadata.milestone_approvals), 105);
-        *vector::borrow(&paper.metadata.milestone_approvals, index)
-    }
-    
-    public fun get_vote_results(vote_record: &VoteRecord): (u64, u64, u64) {
-        (vote_record.yes_votes, vote_record.no_votes, vote_record.total_voters)
+
+    public fun fund_milestone(paper: &mut ResearchPaper, vote: &VoteRecord) {
+        assert!(!paper.is_revoked, 300);
+        let idx = paper.current_milestone;
+        if (vote.yes_votes > vote.total_voters / 2) {
+            let m = vector::borrow_mut(&mut paper.metadata.milestone_approvals, idx);
+            *m = true;
+            paper.current_milestone = idx + 1;
+        };
     }
 }
