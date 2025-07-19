@@ -9,6 +9,7 @@ Iota = { git = "https://github.com/iotaledger/iota.git", subdir = "crates/iota-f
 
 [addresses]
 research = "0x0"
+mockusdt = "0x0"
 
 # The Iota framework automatically adds these standard addresses
 # std = "0x1" 
