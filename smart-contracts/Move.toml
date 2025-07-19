@@ -8,6 +8,7 @@ edition = "2024.beta"
 Iota = { git = "https://github.com/iotaledger/iota.git", subdir = "crates/iota-framework/packages/iota-framework", rev = "framework/testnet" }
 
 [addresses]
+research_fund = "0x0"
 research = "0x0"
 mockusdt = "0x0"
 
